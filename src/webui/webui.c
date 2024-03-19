@@ -52,6 +52,10 @@
 #include <sys/socket.h>
 #endif
 
+#if ENABLE_HDHOMERUN_SERVER
+#include "upnp.h"
+#endif
+
 enum {
   PLAYLIST_M3U,
   PLAYLIST_E2,
@@ -65,6 +69,12 @@ enum {
 };
 
 static int webui_xspf;
+
+#if ENABLE_HDHOMERUN_SERVER
+#define UPNP_MAX_AGE 1800
+static int http_server_port;
+static upnp_service_t *hdhr_server_upnp_discovery;
+#endif
 
 /**
  *
@@ -2181,6 +2191,162 @@ hdhomerun_server_device_xml(http_connection_t *hc, const char *remain, void *opa
   http_output_content(hc, "application/xml");
   return 0;
 }
+
+/**
+ * Handle the HDHomeRun discovery response.
+ */
+static void
+hdhr_server_upnp_send_discover_reply
+  (struct sockaddr_storage *dst, const char *deviceid, int from_multicast)
+{
+  if (!config.hdhomerun_server_enable)
+    return;
+
+#define MSG "\
+HTTP/1.1 200 OK\r\n\
+CACHE-CONTROL: max-age=%d\r\n\
+EXT:\r\n\
+MANIFESTATION: local\r\n\
+LOCATION: http://%s:%i%s/device.xml\r\n\
+SERVER: unix/1.0 UPnP/1.1 TVHeadend/%s\r\n\
+ST: upnp:rootdevice\r\n\
+USN: uuid:%08X::upnp:rootdevice\r\n"
+
+  char buf[512];
+  htsbuf_queue_t q;
+  struct sockaddr_storage storage;
+
+  if (hdhr_server_upnp_discovery == NULL)
+    return;
+
+  if (tvhtrace_enabled()) {
+    tcp_get_str_from_ip(dst, buf, sizeof(buf));
+    tvhtrace(LS_WEBUI, "sending discover reply to %s:%d%s%s",
+             buf, ntohs(IP_PORT(*dst)), deviceid ? " device: " : "", deviceid ?: "");
+  }
+
+  snprintf(buf, sizeof(buf), MSG, UPNP_MAX_AGE,
+           "%s", tvheadend_webui_port, tvheadend_webroot ?: "",
+           tvheadend_version,
+           hdhomerun_get_deviceid());
+
+  htsbuf_queue_init(&q, 0);
+  htsbuf_append_str(&q, buf);
+  htsbuf_append(&q, "\r\n", 2);
+  storage = *dst;
+  upnp_send(&q, &storage, 0, from_multicast,1);
+
+  htsbuf_queue_flush(&q);
+#undef MSG
+}
+
+/**
+ * React to a discovery request from a HDHomeRun client.
+ * Calls hdhr_server_upnp_send_discover_reply to send a response.
+ */
+static void
+hdhr_server_upnp_discovery_received
+  (uint8_t *data, size_t len, udp_connection_t *conn,
+   struct sockaddr_storage *storage)
+{
+  if (!config.hdhomerun_server_enable)
+    return;
+
+#define MSEARCH "M-SEARCH * HTTP/1.1"
+
+  char *buf, *ptr, *saveptr;
+  char *argv[10];
+  char *st = NULL, *man = NULL, *host = NULL, *deviceid = NULL, *searchport = NULL;
+  char buf2[64];
+
+  if (tvheadend_webui_port <= 0)
+    return;
+
+  if (len < 32 || len > 8191)
+    return;
+
+  if (strncmp((char *)data, MSEARCH, sizeof(MSEARCH) - 1))
+    return;
+
+#undef MSEARCH
+
+  buf = alloca(len+1);
+  memcpy(buf, data, len);
+  buf[len] = '\0';
+  ptr = strtok_r(buf, "\r\n", &saveptr);
+  /* Request decoder */
+  if (!ptr) 
+    return;
+  if (http_tokenize(ptr, argv, 3, -1) != 3)
+    return;
+  if (conn->multicast) {
+    if (strcmp(argv[0], "M-SEARCH"))
+      return;
+    if (strcmp(argv[1], "*"))
+      return;
+    if (strcmp(argv[2], "HTTP/1.1"))
+      return;
+  } else {
+    if (strcmp(argv[0], "HTTP/1.1"))
+      return;
+    if (strcmp(argv[1], "200"))
+      return;
+  }
+  ptr = strtok_r(NULL, "\r\n", &saveptr);
+  /* Header decoder */
+  while (ptr) {
+    if (http_tokenize(ptr, argv, 2, ':') == 2) {
+      if (strcmp(argv[0], "ST") == 0)
+        st = argv[1];
+      else if (strcasecmp(argv[0], "HOST") == 0)
+        host = argv[1];
+      else if (strcasecmp(argv[0], "MAN") == 0)
+        man = argv[1];
+      else if (strcmp(argv[0], "SEARCHPORT.UPNP.ORG") == 0)
+        searchport = argv[1];
+    }
+    ptr = strtok_r(NULL, "\r\n", &saveptr);
+  }
+  /* Validation */
+  if (searchport && strcmp(searchport, "1900"))
+    return;
+  if (st == NULL || (strcmp(st, "upnp:rootdevice") && strcmp(st, "ssdp:all")))
+    return;
+  if (man == NULL || strcmp(man, "\"ssdp:discover\""))
+    return;
+  if (deviceid)
+    return;
+  if (host == NULL)
+    return;
+  if (http_tokenize(host, argv, 2, ':') != 2)
+    return;
+  if (strcmp(argv[1], "1900"))
+    return;
+  if (conn->multicast && strcmp(argv[0], "239.255.255.250"))
+    return;
+
+  if (tvhtrace_enabled()) {
+    tcp_get_str_from_ip(storage, buf2, sizeof(buf2));
+    tvhtrace(LS_WEBUI, "received %s M-SEARCH from %s:%d",
+             conn->multicast ? "multicast" : "unicast",
+             buf2, ntohs(IP_PORT(*storage)));
+  }
+
+  if (!conn->multicast) {
+    hdhr_server_upnp_send_discover_reply(storage, NULL, 0);
+  } else {
+    hdhr_server_upnp_send_discover_reply(storage, NULL, 1);
+  }
+}
+
+static void
+hdhr_server_upnp_discovery_destroy(upnp_service_t *upnp)
+{
+  if (!config.hdhomerun_server_enable)
+    return;
+  hdhr_server_upnp_discovery = NULL;
+}
+
 #endif  /* ENABLE_HDHOMERUN_SERVER */
 
 /**
@@ -2752,6 +2918,20 @@ webui_init(int xspf)
   http_path_add("/lineup_status.json", NULL, hdhomerun_server_lineup_status, ACCESS_ANONYMOUS);
   http_path_add("/lineup.post", NULL, hdhomerun_server_lineup_post, ACCESS_ANONYMOUS);
   http_path_add("/device.xml", NULL, hdhomerun_server_device_xml, ACCESS_ANONYMOUS);
+
+  /* Setup SSDP discovery */
+
+  if (http_server_port == 0) {
+    http_server_port = tvheadend_webui_port;
+  }
+
+  hdhr_server_upnp_discovery = upnp_service_create(upnp_service);
+    if (hdhr_server_upnp_discovery == NULL) {
+      tvherror(LS_WEBUI, "unable to create UPnP discovery service");
+    } else {
+      hdhr_server_upnp_discovery->us_received = hdhr_server_upnp_discovery_received;
+      hdhr_server_upnp_discovery->us_destroy  = hdhr_server_upnp_discovery_destroy;
+    }
 #endif
 
   http_path_add_modify("/play", NULL, page_play, ACCESS_ANONYMOUS, page_play_path_modify5);
