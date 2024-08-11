@@ -2150,6 +2150,8 @@ hdhomerun_server_lineup(http_connection_t *hc, const char *remain, void *opaque)
   channel_t *ch;
   const char *name;
   const char *blank;
+  profile_t *pro = NULL;
+  char *profile_enc;
   const char *chnum_str;
   const int use_auth = perm && perm->aa_auth && !strempty(perm->aa_auth);
   char buf1[128], chnum[32], ubuf[UUID_HEX_SIZE];
@@ -2168,9 +2170,24 @@ hdhomerun_server_lineup(http_connection_t *hc, const char *remain, void *opaque)
   blank = tvh_gettext_lang(perm->aa_lang_ui, channel_blank_name);
   htsbuf_append_str(hq, "[");
   tvh_mutex_lock(&global_lock);
+  /* streaming profile: the first one of the access entry, looked up under
+   * global_lock so it cannot be deleted while in use */
+  if (hc->hc_access->aa_profiles)
+    pro = profile_find_by_uuid(htsmsg_field_get_str(HTSMSG_FIRST(hc->hc_access->aa_profiles)));
+  profile_enc = url_encode(pro ? profile_get_name(pro) : "pass");
   CHANNEL_FOREACH(ch) {
     if (!channel_access(ch, perm, 0) || !ch->ch_enabled)
       continue;
+    if (snprintf(url, sizeof(url), "http://%s:%u/stream/channel/%s?profile=%s%s%s",
+                 http_ip,
+                 tvheadend_webui_port,
+                 channel_get_uuid(ch, ubuf),
+                 profile_enc,
+                 use_auth ? "&auth=" : "",
+                 use_auth ? perm->aa_auth : "") >= (int)sizeof(url)) {
+      tvherror(LS_WEBUI, "HDHomeRun lineup: stream URL too long, skipping channel");
+      continue;
+    }
     if (!is_first)
       htsbuf_append_str(hq, ", \n");
     name = channel_get_ename(ch, buf1, sizeof(buf1), blank, flags);
@@ -2181,17 +2198,12 @@ hdhomerun_server_lineup(http_connection_t *hc, const char *remain, void *opaque)
     chnum_str = channel_get_number_as_str(ch, chnum, sizeof(chnum));
     htsbuf_append_and_escape_jsonstr(hq, chnum_str ? chnum_str : "0");
     htsbuf_append_str(hq, ", \"URL\" : ");
-    sprintf(url, "http://%s:%u/stream/channel/%s?profile=pass%s%s",
-            http_ip,
-            tvheadend_webui_port,
-            channel_get_uuid(ch, ubuf),
-            use_auth? "&auth=" : "",
-            use_auth ? perm->aa_auth : "");
     htsbuf_append_and_escape_jsonstr(hq, url);
     htsbuf_append_str(hq, "}");
     is_first = 0;
   }
   tvh_mutex_unlock(&global_lock);
+  free(profile_enc);
   htsbuf_append_str(hq, "]");
   http_output_content(hc, "application/json");
   return 0;
