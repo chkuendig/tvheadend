@@ -557,10 +557,18 @@ udp_write_fill_source( udp_connection_t *uc, const void *buf, size_t len,
 
     tvhdebug(uc->subsystem, "Got source IP address: %s", inet_ntoa(local_addr.sin_addr));
 
+    tvhdebug(uc->subsystem, "Input msg [len: %ld]", len);
+    tvhlog_hexdump(uc->subsystem, buf, len);
     len += strlen(inet_ntoa(local_addr.sin_addr)) - 2;
+    tvhdebug(uc->subsystem, "Input msg buffer new [len: %ld]", len);
+    
     char* data = malloc(len + 1);
+    char* str_buf = malloc(len + 1);
+    memcpy(str_buf, buf, len);
+    str_buf[len] = '\0';
 
-    len = snprintf(data, len + 1, buf, inet_ntoa(local_addr.sin_addr));
+    tvhlog_hexdump(uc->subsystem, str_buf, len+1);
+    len = snprintf(data, len + 1, str_buf, inet_ntoa(local_addr.sin_addr));
 
     tvhdebug(uc->subsystem, "Assembled msg [len: %ld]", len);
     tvhlog_hexdump(uc->subsystem, data, len);
@@ -581,6 +589,7 @@ udp_write_fill_source( udp_connection_t *uc, const void *buf, size_t len,
     }
 
     free(data);
+    free(str_buf);
     close(cloned_sockfd);
 
     return len;
