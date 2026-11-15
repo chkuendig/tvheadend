@@ -1031,8 +1031,18 @@ static void satip_server_init_common(const char *prefix, int announce)
     return;
 
   if (http_server_port == 0) {
-    http_server_ip = satip_server_bindaddr ? strdup(satip_server_bindaddr) : NULL;
     tcp_server_t* srv = http_server;
+    if (satip_server_bindaddr) {
+      http_server_ip = strdup(satip_server_bindaddr);
+    } else if (!tcp_server_onall(srv)) {
+      /* HTTP is bound to one address: advertise that one, not the interface
+       * a discovery request happened to arrive on */
+      char ip[64];
+      tcp_get_str_from_ip(&srv->bound, ip, sizeof(ip));
+      http_server_ip = strdup(ip);
+    } else {
+      http_server_ip = NULL;
+    }
     http_server_port = ntohs(IP_PORT(srv->bound));
   }
 
